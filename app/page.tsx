@@ -269,6 +269,34 @@ export default function Home() {
   const hasCarTransport = activeTransports.includes('car');
   const activeDocuments = parseDocuments(currentDay.documents);
 
+  /**
+   * Elimina un documento del drawer:
+   * 1. Si tiene storagePath, borra el archivo del bucket.
+   * 2. Actualiza el array documents en trip_days.
+   * 3. Refresca los días del grupo.
+   */
+  const handleDeleteDocumentFromDrawer = async (doc: import('@/lib/transports').TripDayDocument, idx: number) => {
+    // 1. Borrar del Storage si corresponde
+    if (doc.storagePath) {
+      const { error: storageErr } = await supabase.storage
+        .from('trip-documents')
+        .remove([doc.storagePath]);
+      if (storageErr) {
+        console.warn('No se pudo eliminar el archivo del storage:', storageErr.message);
+      }
+    }
+
+    // 2. Actualizar el array de documentos en la BD
+    const updatedDocs = activeDocuments.filter((_, i) => i !== idx);
+    await supabase
+      .from('trip_days')
+      .update({ documents: updatedDocs.length > 0 ? updatedDocs : null })
+      .eq('id', currentDay.id);
+
+    // 3. Refrescar datos
+    fetchDays(currentGroupName);
+  };
+
   return (
     <div className="min-h-screen bg-slate-100 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col font-sans transition-colors duration-200">
 
@@ -739,6 +767,7 @@ export default function Home() {
         city={currentDay.city || 'Destino'}
         documents={activeDocuments}
         onOpenEdit={() => setIsEditOpen(true)}
+        onDeleteDocument={handleDeleteDocumentFromDrawer}
       />
 
       {/* Modal de nuevo grupo */}

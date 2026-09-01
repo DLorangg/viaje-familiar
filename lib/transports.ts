@@ -7,7 +7,9 @@ export interface TripDayDocument {
   id?: string;
   title: string;
   url: string;
-  type?: 'ticket' | 'pdf' | 'qr' | 'link' | 'hotel' | 'flight' | 'train';
+  type?: 'ticket' | 'pdf' | 'qr' | 'link' | 'hotel' | 'flight' | 'train' | 'image';
+  /** Ruta interna en el bucket de Supabase Storage (solo para archivos subidos directamente) */
+  storagePath?: string;
 }
 
 export interface TripDay {

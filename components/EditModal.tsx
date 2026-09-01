@@ -1,9 +1,9 @@
 // components/EditModal.tsx
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
-import { X, Trash2, PlusCircle, Check, Building2, Ticket, Link as LinkIcon, Plus } from 'lucide-react';
+import { X, Trash2, PlusCircle, Check, Building2, Ticket, Plus, Upload, AlertCircle, Loader2 } from 'lucide-react';
 import {
   TRANSPORT_LIST,
   parseTransports,
@@ -31,11 +31,21 @@ export default function EditModal({ day, isOpen, onClose, onUpdated, onAddDay }:
   const [accommodationName, setAccommodationName] = useState('');
   const [accommodationAddress, setAccommodationAddress] = useState('');
   const [documents, setDocuments] = useState<TripDayDocument[]>([]);
+  /** Paths de Storage a eliminar cuando el usuario presione Guardar */
+  const [pendingDeletePaths, setPendingDeletePaths] = useState<string[]>([]);
   const [newDocTitle, setNewDocTitle] = useState('');
   const [newDocUrl, setNewDocUrl] = useState('');
   const [newDocType, setNewDocType] = useState<'ticket' | 'pdf' | 'qr' | 'link' | 'hotel' | 'flight' | 'train'>('ticket');
   const [showAddDocForm, setShowAddDocForm] = useState(false);
   const [loading, setLoading] = useState(false);
+  /** Indica si hay una subida de archivo en curso */
+  const [uploading, setUploading] = useState(false);
+  /** Progreso de subida 0-100, null si no hay subida activa */
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  /** Mensaje de error inline de subida */
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (day && isOpen) {
@@ -47,10 +57,13 @@ export default function EditModal({ day, isOpen, onClose, onUpdated, onAddDay }:
       setAccommodationName(day.accommodation_name || '');
       setAccommodationAddress(day.accommodation_address || '');
       setDocuments(parseDocuments(day.documents));
+      setPendingDeletePaths([]);
       setShowAddDocForm(false);
       setNewDocTitle('');
       setNewDocUrl('');
       setNewDocType('ticket');
+      setUploadError(null);
+      setUploadProgress(null);
     }
   }, [day, isOpen]);
 
@@ -84,8 +97,83 @@ export default function EditModal({ day, isOpen, onClose, onUpdated, onAddDay }:
     setShowAddDocForm(false);
   };
 
+  /**
+   * Marca el documento para eliminación diferida:
+   * - Lo quita del estado local inmediatamente (UX).
+   * - Si tiene storagePath, lo encola en `pendingDeletePaths` para borrarlo
+   *   del bucket cuando el usuario presione "Guardar Cambios".
+   */
   const handleRemoveDocument = (indexToRemove: number) => {
+    const doc = documents[indexToRemove];
+    if (doc?.storagePath) {
+      setPendingDeletePaths((prev) => [...prev, doc.storagePath!]);
+    }
     setDocuments((prev) => prev.filter((_, idx) => idx !== indexToRemove));
+  };
+
+  /** Sube un archivo al bucket trip-documents y agrega el documento al estado local */
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !day) return;
+
+    // Limpiar input para permitir re-seleccionar el mismo archivo
+    if (fileInputRef.current) fileInputRef.current.value = '';
+
+    setUploadError(null);
+    setUploading(true);
+    setUploadProgress(0);
+
+    // Nombre único: grupo/timestamp-nombrearchivo
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const path = `${day.group_name}/${Date.now()}-${safeName}`;
+
+    // Animar progreso indeterminado (Supabase JS no emite eventos granulares de progreso)
+    let fakeProgress = 0;
+    const progressInterval = setInterval(() => {
+      fakeProgress = Math.min(fakeProgress + 8, 85);
+      setUploadProgress(fakeProgress);
+    }, 120);
+
+    try {
+      const { error: uploadErr } = await supabase.storage
+        .from('trip-documents')
+        .upload(path, file, { upsert: false });
+
+      clearInterval(progressInterval);
+
+      if (uploadErr) {
+        setUploadError(`Error al subir: ${uploadErr.message}`);
+        setUploading(false);
+        setUploadProgress(null);
+        return;
+      }
+
+      setUploadProgress(100);
+
+      const { data: urlData } = supabase.storage
+        .from('trip-documents')
+        .getPublicUrl(path);
+
+      const isImage = file.type.startsWith('image/');
+      const newDoc: TripDayDocument = {
+        id: String(Date.now()),
+        title: file.name,
+        url: urlData.publicUrl,
+        type: isImage ? 'image' : 'pdf',
+        storagePath: path,
+      };
+
+      setDocuments((prev) => [...prev, newDoc]);
+    } catch (err) {
+      clearInterval(progressInterval);
+      setUploadError('Error inesperado al subir el archivo.');
+    } finally {
+      // Breve pausa para mostrar el 100% antes de ocultar
+      setTimeout(() => {
+        setUploading(false);
+        setUploadProgress(null);
+      }, 600);
+    }
   };
 
   // Buscar coordenadas automáticamente si se cambia la ciudad
@@ -106,11 +194,23 @@ export default function EditModal({ day, isOpen, onClose, onUpdated, onAddDay }:
     e.preventDefault();
     setLoading(true);
 
+    // 1. Eliminar del Storage los archivos marcados para borrado diferido
+    if (pendingDeletePaths.length > 0) {
+      const { error: deleteErr } = await supabase.storage
+        .from('trip-documents')
+        .remove(pendingDeletePaths);
+      if (deleteErr) {
+        console.warn('Algunos archivos no pudieron eliminarse del Storage:', deleteErr.message);
+      }
+    }
+
+    // 2. Obtener coordenadas si cambió la ciudad
     let coords = { lat: day.lat, lng: day.lng };
     if (city.trim().toLowerCase() !== (day.city || '').toLowerCase()) {
       coords = await fetchCoordinates(city);
     }
 
+    // 3. Guardar en la base de datos
     const { error } = await supabase
       .from('trip_days')
       .update({
@@ -143,6 +243,17 @@ export default function EditModal({ day, isOpen, onClose, onUpdated, onAddDay }:
     setLoading(false);
     onUpdated();
     onClose();
+  };
+
+  const docTypeLabel: Record<string, string> = {
+    ticket: '🎟️ Entrada',
+    hotel: '🏨 Hotel',
+    train: '🚆 Tren',
+    flight: '✈️ Vuelo',
+    pdf: '📄 PDF',
+    image: '🖼️ Imagen',
+    qr: '📱 QR',
+    link: '🔗 Link',
   };
 
   return (
@@ -269,33 +380,101 @@ export default function EditModal({ day, isOpen, onClose, onUpdated, onAddDay }:
                 <Ticket className="w-4 h-4 text-amber-700" /> Bóveda de Tickets y Vouchers ({documents.length})
               </label>
               {!showAddDocForm && (
-                <button
-                  type="button"
-                  onClick={() => setShowAddDocForm(true)}
-                  className="text-xs font-bold text-emerald-800 hover:text-emerald-950 flex items-center gap-1 cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5" /> Agregar ticket
-                </button>
+                <div className="flex items-center gap-2">
+                  {/* Botón subir archivo */}
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={uploading}
+                    className="text-xs font-bold text-sky-700 hover:text-sky-900 flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Subir PDF o imagen"
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    Subir archivo
+                  </button>
+                  {/* Input file oculto */}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="application/pdf,image/*"
+                    className="hidden"
+                    onChange={handleFileUpload}
+                  />
+                  {/* Botón agregar por URL */}
+                  <button
+                    type="button"
+                    onClick={() => setShowAddDocForm(true)}
+                    className="text-xs font-bold text-emerald-800 hover:text-emerald-950 flex items-center gap-1 cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Agregar URL
+                  </button>
+                </div>
               )}
             </div>
+
+            {/* Barra de progreso de subida */}
+            {uploading && (
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2 text-xs text-sky-700 font-semibold">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Subiendo archivo{uploadProgress !== null ? `... ${uploadProgress}%` : '...'}</span>
+                </div>
+                <div className="w-full bg-sky-100 rounded-full h-1.5 overflow-hidden">
+                  <div
+                    className="bg-sky-500 h-1.5 rounded-full transition-all duration-150"
+                    style={{ width: `${uploadProgress ?? 0}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Error de subida */}
+            {uploadError && (
+              <div className="flex items-center gap-2 text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                <span>{uploadError}</span>
+                <button
+                  type="button"
+                  onClick={() => setUploadError(null)}
+                  className="ml-auto text-red-400 hover:text-red-600"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            )}
 
             {/* Lista de documentos guardados */}
             {documents.length > 0 && (
               <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
                 {documents.map((doc, idx) => (
                   <div
-                    key={idx}
+                    key={doc.id || idx}
                     className="flex items-center justify-between p-2 bg-white rounded-xl border border-amber-200/60 text-xs shadow-2xs"
                   >
                     <div className="flex items-center gap-2 min-w-0 flex-1">
-                      <span className="text-sm">🎟️</span>
-                      <span className="font-bold text-slate-800 truncate">{doc.title}</span>
+                      <span className="text-sm shrink-0">
+                        {doc.type === 'image' ? '🖼️' :
+                         doc.type === 'pdf'   ? '📄' :
+                         doc.type === 'hotel' ? '🏨' :
+                         doc.type === 'flight'? '✈️' :
+                         doc.type === 'train' ? '🚆' :
+                         doc.type === 'link'  ? '🔗' :
+                         doc.type === 'qr'   ? '📱' : '🎟️'}
+                      </span>
+                      <div className="min-w-0">
+                        <span className="font-bold text-slate-800 truncate block">{doc.title}</span>
+                        {doc.storagePath && (
+                          <span className="text-[10px] text-slate-400 truncate block">
+                            📎 {docTypeLabel[doc.type ?? ''] ?? 'Archivo'}
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <button
                       type="button"
                       onClick={() => handleRemoveDocument(idx)}
-                      className="text-red-500 hover:text-red-700 p-1 rounded transition cursor-pointer"
-                      title="Eliminar ticket"
+                      className="text-red-500 hover:text-red-700 p-1 rounded transition cursor-pointer shrink-0"
+                      title="Eliminar ticket (se borrará al guardar)"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
@@ -304,7 +483,14 @@ export default function EditModal({ day, isOpen, onClose, onUpdated, onAddDay }:
               </div>
             )}
 
-            {/* Formulario para agregar documento */}
+            {/* Indicador de archivos pendientes de eliminar */}
+            {pendingDeletePaths.length > 0 && (
+              <p className="text-[10px] text-amber-700 font-semibold">
+                ⚠️ {pendingDeletePaths.length} archivo{pendingDeletePaths.length > 1 ? 's' : ''} se eliminará{pendingDeletePaths.length > 1 ? 'n' : ''} del storage al guardar.
+              </p>
+            )}
+
+            {/* Formulario para agregar documento por URL */}
             {showAddDocForm && (
               <div className="bg-white p-3 rounded-xl border border-amber-200 space-y-2">
                 <div className="grid grid-cols-3 gap-2">
@@ -402,10 +588,10 @@ export default function EditModal({ day, isOpen, onClose, onUpdated, onAddDay }:
             </button>
             <button
               type="submit"
-              disabled={loading}
+              disabled={loading || uploading}
               className="flex-1 py-3 bg-emerald-700 font-bold text-white text-sm rounded-xl hover:bg-emerald-800 shadow-md transition disabled:opacity-50 cursor-pointer"
             >
-              {loading ? 'Guardando...' : 'Guardar Cambios'}
+              {loading ? 'Guardando...' : uploading ? 'Subiendo archivo...' : 'Guardar Cambios'}
             </button>
           </div>
         </form>
