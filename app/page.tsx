@@ -23,8 +23,10 @@ import TaxFreeTracker from '@/components/TaxFreeTracker';
 import EuskeraGlossary from '@/components/EuskeraGlossary';
 import ThemeToggle from '@/components/ThemeToggle';
 import WelcomeGroupModal from '@/components/WelcomeGroupModal';
+import DaySearchModal from '@/components/DaySearchModal';
 import PanuelicoIcon from '@/components/PanuelicoIcon';
 import {
+  Search,
   ChevronLeft,
   ChevronRight,
   Edit3,
@@ -77,11 +79,24 @@ export default function Home() {
   const [isTaxFreeOpen, setIsTaxFreeOpen] = useState(false);
   const [isGlossaryOpen, setIsGlossaryOpen] = useState(false);
   const [isWelcomeOpen, setIsWelcomeOpen] = useState(false);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isRadarMode, setIsRadarMode] = useState(false);
   const [radarDays, setRadarDays] = useState<RadarGroupDay[]>([]);
   const [loading, setLoading] = useState(true);
   const [shareToast, setShareToast] = useState(false);
   const [isOffline, setIsOffline] = useState(false);
+
+  // Atajo de teclado global: Cmd + K / Ctrl + K para abrir el buscador rápido
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsSearchOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   // Monitor de estado online / offline
   useEffect(() => {
@@ -140,6 +155,56 @@ export default function Home() {
     init();
   }, []);
 
+  // Determina el día inicial de forma inteligente (viaje real julio 2027 o sessionStorage)
+  const applySmartDayIndex = (loadedDays: TripDay[], groupName: string) => {
+    if (!loadedDays || loadedDays.length === 0) return;
+
+    // 1. Comprobar si la fecha de hoy coincide con el rango del viaje (2 al 25 de julio de 2027)
+    const now = new Date();
+    const isJuly2027 = now.getFullYear() === 2027 && now.getMonth() === 6; // 6 = Julio
+    const dayOfMonth = now.getDate();
+
+    if (isJuly2027 && dayOfMonth >= 2 && dayOfMonth <= 25) {
+      // 2 de julio es Día 1, 3 de julio es Día 2, ..., 25 de julio es Día 24
+      const targetDayNumber = dayOfMonth - 1;
+      const matchingIdx = loadedDays.findIndex((d) => d.day_number === targetDayNumber);
+      if (matchingIdx !== -1) {
+        setCurrentIndex(matchingIdx);
+        return;
+      }
+    }
+
+    // 2. Si no coincide, consultar sessionStorage
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = sessionStorage.getItem(`last_day_index_${groupName}`);
+        if (saved !== null) {
+          const parsed = parseInt(saved, 10);
+          if (!isNaN(parsed) && parsed >= 0 && parsed < loadedDays.length) {
+            setCurrentIndex(parsed);
+            return;
+          }
+        }
+      } catch {
+        // Ignorar restricciones en entornos sin acceso a sessionStorage
+      }
+    }
+
+    // 3. En su defecto, iniciar en el Día 1 (índice 0)
+    setCurrentIndex(0);
+  };
+
+  // Guardar en sessionStorage cada vez que el usuario cambia de día
+  useEffect(() => {
+    if (typeof window !== 'undefined' && currentGroupName && days.length > 0) {
+      try {
+        sessionStorage.setItem(`last_day_index_${currentGroupName}`, String(currentIndex));
+      } catch {
+        // Ignorar errores en almacenamiento
+      }
+    }
+  }, [currentIndex, currentGroupName, days.length]);
+
   // 2. Cargar días del grupo seleccionado con soporte offline
   const fetchDays = async (groupName: string) => {
     setLoading(true);
@@ -155,13 +220,22 @@ export default function Home() {
       if (!error && data && data.length > 0) {
         setDays(data);
         localStorage.setItem(localDaysKey, JSON.stringify(data));
+        applySmartDayIndex(data, groupName);
       } else {
         const cached = localStorage.getItem(localDaysKey);
-        if (cached) setDays(JSON.parse(cached));
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          setDays(parsed);
+          applySmartDayIndex(parsed, groupName);
+        }
       }
     } catch {
       const cached = localStorage.getItem(localDaysKey);
-      if (cached) setDays(JSON.parse(cached));
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        setDays(parsed);
+        applySmartDayIndex(parsed, groupName);
+      }
     }
     setLoading(false);
   };
@@ -407,6 +481,19 @@ export default function Home() {
             {/* Toggle de Modo Oscuro */}
             <ThemeToggle />
           </div>
+
+          {/* Botón Buscador Rápido (Cmd+K / Ctrl+K) */}
+          <button
+            onClick={() => setIsSearchOpen(true)}
+            className="flex items-center gap-1.5 bg-white/15 hover:bg-white/25 border border-white/20 px-2.5 py-2 rounded-xl text-xs font-bold text-white transition cursor-pointer shadow-xs active:scale-95"
+            title="Buscador rápido de itinerario (Ctrl+K o ⌘K)"
+          >
+            <Search className="w-3.5 h-3.5 text-amber-300" />
+            <span className="hidden sm:inline">Buscar</span>
+            <kbd className="hidden md:inline-flex items-center px-1.5 py-0.5 text-[10px] font-semibold text-emerald-200 bg-black/25 rounded border border-white/10">
+              ⌘K
+            </kbd>
+          </button>
 
           {/* Chip de identidad activa + botón cambiar grupo */}
           <button
@@ -844,6 +931,17 @@ export default function Home() {
       <EuskeraGlossary
         isOpen={isGlossaryOpen}
         onClose={() => setIsGlossaryOpen(false)}
+      />
+
+      {/* Buscador Rápido de Itinerario (Cmd+K / Ctrl+K) */}
+      <DaySearchModal
+        isOpen={isSearchOpen}
+        onClose={() => setIsSearchOpen(false)}
+        days={days}
+        onSelectDay={(index) => {
+          setCurrentIndex(index);
+          setIsSearchOpen(false);
+        }}
       />
 
     </div>

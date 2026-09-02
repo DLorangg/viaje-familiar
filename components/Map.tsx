@@ -1,7 +1,7 @@
 // components/Map.tsx
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { parseTransports, TRANSPORT_OPTIONS } from '@/lib/transports';
@@ -43,18 +43,48 @@ export default function Map({
   isRadarMode = false,
   radarDays = [],
 }: MapProps) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
   const polylineRef = useRef<L.Polyline | null>(null);
+  const inactivityTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const [isInteractive, setIsInteractive] = useState(false);
+
+  // Reiniciar temporizador de inactividad (5 segundos)
+  const resetInactivityTimer = useCallback(() => {
+    if (inactivityTimerRef.current) {
+      clearTimeout(inactivityTimerRef.current);
+    }
+    inactivityTimerRef.current = setTimeout(() => {
+      setIsInteractive(false);
+    }, 5000);
+  }, []);
+
+  const activateMap = () => {
+    setIsInteractive(true);
+    resetInactivityTimer();
+  };
+
+  const deactivateMap = useCallback(() => {
+    if (inactivityTimerRef.current) {
+      clearTimeout(inactivityTimerRef.current);
+      inactivityTimerRef.current = null;
+    }
+    setIsInteractive(false);
+  }, []);
 
   // 1. Inicialización segura del mapa
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
+    // Inicializar bloqueado para scroll y arrastre
     const map = L.map(mapContainerRef.current, {
       zoomControl: true,
-      scrollWheelZoom: true,
+      scrollWheelZoom: false,
+      dragging: false,
+      touchZoom: false,
     }).setView([40.4168, -3.7038], 5);
 
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -65,6 +95,11 @@ export default function Map({
     markersLayerRef.current = L.layerGroup().addTo(map);
     mapInstanceRef.current = map;
 
+    const handleLeafletInteraction = () => {
+      resetInactivityTimer();
+    };
+    map.on('movestart zoomstart dragstart', handleLeafletInteraction);
+
     const timer = setTimeout(() => {
       if (mapInstanceRef.current) {
         mapInstanceRef.current.invalidateSize();
@@ -73,12 +108,51 @@ export default function Map({
 
     return () => {
       clearTimeout(timer);
+      if (inactivityTimerRef.current) {
+        clearTimeout(inactivityTimerRef.current);
+      }
+      map.off('movestart zoomstart dragstart', handleLeafletInteraction);
       if (mapInstanceRef.current) {
         mapInstanceRef.current.remove();
         mapInstanceRef.current = null;
       }
     };
-  }, []);
+  }, [resetInactivityTimer]);
+
+  // Habilitar o deshabilitar interacción en el mapa dinámicamente
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+
+    if (isInteractive) {
+      map.dragging.enable();
+      map.touchZoom.enable();
+      map.scrollWheelZoom.enable();
+    } else {
+      map.dragging.disable();
+      map.touchZoom.disable();
+      map.scrollWheelZoom.disable();
+    }
+  }, [isInteractive]);
+
+  // Detectar clic o tap fuera del mapa para desactivar
+  useEffect(() => {
+    if (!isInteractive) return;
+
+    const handleClickOutside = (event: MouseEvent | TouchEvent) => {
+      if (
+        wrapperRef.current &&
+        !wrapperRef.current.contains(event.target as Node)
+      ) {
+        deactivateMap();
+      }
+    };
+
+    document.addEventListener('pointerdown', handleClickOutside);
+    return () => {
+      document.removeEventListener('pointerdown', handleClickOutside);
+    };
+  }, [isInteractive, deactivateMap]);
 
   // 2. Actualización de marcadores y rutas
   useEffect(() => {
@@ -291,5 +365,47 @@ export default function Map({
     }
   }, [days, currentDayIndex, onSelectDay, isRadarMode, radarDays]);
 
-  return <div ref={mapContainerRef} className="w-full h-full min-h-[440px] rounded-2xl" />;
+  return (
+    <div
+      ref={wrapperRef}
+      className="relative w-full h-full min-h-[440px] rounded-2xl overflow-hidden select-none"
+      onPointerDown={() => isInteractive && resetInactivityTimer()}
+      onTouchMove={() => isInteractive && resetInactivityTimer()}
+    >
+      <div ref={mapContainerRef} className="w-full h-full min-h-[440px] rounded-2xl" />
+
+      {/* Overlay cuando el mapa está en modo pasivo (permite scroll vertical fluido en móviles) */}
+      {!isInteractive && (
+        <div
+          onClick={activateMap}
+          className="absolute inset-0 z-[1000] flex items-center justify-center bg-slate-900/10 backdrop-blur-[0.5px] cursor-pointer"
+          style={{ touchAction: 'pan-y' }}
+          title="Hacer clic o tocar para interactuar con el mapa"
+        >
+          <div className="bg-slate-900/85 hover:bg-slate-900 text-white text-xs font-bold px-4 py-2 rounded-full shadow-xl backdrop-blur-md flex items-center gap-2 border border-white/20 transition transform active:scale-95 pointer-events-none animate-pulse">
+            <span className="text-base">👆</span>
+            <span>Tocar para activar mapa</span>
+          </div>
+        </div>
+      )}
+
+      {/* Indicador cuando el mapa está interactivo (permite desactivar manualmente) */}
+      {isInteractive && (
+        <div className="absolute top-3 right-3 z-[1000] flex items-center gap-2 pointer-events-auto">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              deactivateMap();
+            }}
+            className="bg-emerald-900/90 hover:bg-emerald-950 text-white text-[11px] font-bold px-3 py-1.5 rounded-full shadow-lg border border-white/20 backdrop-blur-md flex items-center gap-1.5 cursor-pointer transition active:scale-95"
+            title="Bloquear mapa para desplazar la página con facilidad"
+          >
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+            <span>Mapa activo · Bloquear</span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
